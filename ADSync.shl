@@ -1,0 +1,215 @@
+#!/bin/bash
+# ******************************************************************************
+# Script        : ADSync.shl
+# Purpose       : Build data files and send them to the AD server
+# Author        : Scott Tuss
+# Group         : AVC ITS                  
+# Creation Date : 28 AUG 2019
+# Generic       : NO
+#
+# Parameters    : $1 = user credentials
+#               : $2 = database instance
+#               : $3 = AD instance [PROD or TEST]
+#               : $4 = PowerShell mode [AUDIT or UPDATE]
+#               : $5 = 
+#
+# Scripts Called: ADSync_build_files.sql
+#
+# Outputs       : ${LOCAL}/AVC_OUTPUT/ad_sync/AD_Courses.csv
+#               : ${LOCAL}/AVC_OUTPUT/ad_sync/AD_EmpJobDetails.csv
+#               : ${LOCAL}/AVC_OUTPUT/ad_sync/AD_FacAssign.csv
+#               : ${LOCAL}/AVC_OUTPUT/ad_sync/AD_PersonFile.csv
+#               : ${LOCAL}/AVC_OUTPUT/ad_sync/AD_StuEnroll.csv
+#
+# Description   : Builds a set of datafiles that are sent to either the production or test
+#               : domain controller to update Active Directory (AD). After the files have 
+#               : been transferred, ssh is used to execute an import script on the domain
+#               : that processes the datafiles and updates AD.
+#
+#  scp -i /home/avcron/.ssh/ad_sync_id_rsa $LOCAL/AVC_OUTPUT/ad_sync/* banner_ad@dc-t1.test.avc.edu:C:/Scripts/bantoad_data
+#  ssh -i /home/avcron/.ssh/ad_sync_id_rsa banner_ad@dc-t1.test.avc.edu 'uptime'
+#  0 6,10,14,18 * * * /u02/sct/local/exe/ADSync.shl $AVCIDPW AVCPROD PROD AUDIT
+#
+# Modification History:
+# -----------------------------------------------------------------------------
+# Date           Name  Description
+# ----------------------------------------------------------------------------- 
+#                ST    Go-live with CRON processing.
+#
+
+# ***********************************************************************
+# Set general environment for the given Database SID
+# ***********************************************************************
+export ORACLE_SID=$2
+. oraenv_local
+set -x
+
+# ***********************************************************************
+# Set variables
+# ***********************************************************************
+UIDPSWD=$1
+ADINST=$3
+PS_MODE=$4
+
+# Commented out by BTA for testing purposes on 5/28/2021
+if [ "$ADINST" = "PROD" ]
+then
+  REMOTEHOST="dc-lg1.avc.edu"
+else
+  REMOTEHOST="dc-t1.test.avc.edu"
+fi
+
+#REMOTEHOST="dc-t1.test.avc.edu"
+
+REMOTEUSR=banner_ad
+WORKINGDIR="${LOCAL}/AVC_OUTPUT/ad_sync"
+REMOTEDIR="C:/Scripts/bantoad_data"
+NUMFILES=4
+DISTLIST=stuss@avc.edu
+LOG=ADSYNC_`date  +%Y%m%d%H%M%S`.log
+
+ERROR="FALSE"
+
+cd $WORKINGDIR
+
+# The exec line below forces all standard output and standard error to be logged to a file
+# The file is created or appended >>
+exec > $LOG 2>&1
+
+
+echo "Starting AD_sync shell script..."
+echo "==========================================================================="
+echo $$, `date`
+echo "Oracle SID:        $ORACLE_SID"
+echo "Log:               $LOG"
+echo "Remote Host:       $REMOTEHOST"
+echo "DistList:          $DISTLIST"
+echo "==========================================================================="
+
+# ***********************************************************************
+# Function to handle all fatal errors
+# ***********************************************************************
+fatal_error_handler() {
+  echo "--- A fatal error occurred while sending the data files to $REMOTEHOST."
+  echo "--- This script will exit and send an email"
+  cat $LOG |mailx -r "do.not.reply@avc.edu" -s "FAILED: Sending AD data files to $REMOTEHOST" "$DISTLIST"
+  exit 1
+}
+
+# ******************************************************************************
+# Create the AD_Sync data file.
+# ******************************************************************************
+echo "START: ADSync_build_files script"
+
+sqlplus -S $UIDPSWD @${LOCAL_EXE}/ADSync_build_files.sql
+
+# Look to see if the files were created.
+FILES=./AD_*.csv
+x=0
+
+for F in $FILES
+do
+  if [ -f $F ]
+  then
+    echo "  FOUND: `basename $F`"
+    ((x++))
+  else
+    echo "  ERROR: No data files found"
+  fi
+done
+
+echo "END: ADSync_build_files script"
+
+# Make sure that all of the data files were created before continuing
+if [ $x -ne $NUMFILES ]
+then
+  # If the number of files found does not match the number expected, throw an error
+  echo "ERROR: Expected $NUMFILES data files, found $x"
+  fatal_error_handler  
+fi
+
+# ******************************************************************************
+# Send the data files to Domain Controller.
+# ******************************************************************************
+echo ""
+echo ""
+echo "==========================================================================="
+echo "START: Secure copy to $REMOTEHOST Domain Controller"
+echo "==========================================================================="
+
+# Attempt to send the files 5 times. If it fails, exit the script
+x=1
+while [ $x -le 5 ]
+do
+  echo "****************************************"
+  echo "  Attempt: $x"
+  echo "****************************************"
+  date
+
+  scp -o ServerAliveInterval=60 -o ConnectTimeout=45 -o ConnectionAttempts=5 -i /home/avcron/.ssh/ad_sync_id_rsa $LOCAL/AVC_OUTPUT/ad_sync/AD_*.csv ${REMOTEUSR}@${REMOTEHOST}:${REMOTEDIR}
+#
+  if [ $? -ne  0 ]
+  then
+    echo "ERROR: Sending file to $REMOTEHOST"
+    echo "Sleeping for 45 seconds before next attempt"
+    ERROR="TRUE"
+    sleep 45
+  else
+    ERROR="FALSE"
+    break
+  fi
+  ((x++))
+done
+
+# If the files were not sent after five attempts throw an error
+#if [ "$ERROR" = "TRUE" ]
+#then
+#  echo "FATAL ERROR: Sending datafiles to $REMOTEHOST failed"
+#  fatal_error_handler
+#fi
+
+echo ""
+echo "==========================================================================="
+echo "END: Secure copy to $REMOTEHOST Domain Controller"
+echo "==========================================================================="
+
+echo ""
+echo "==========================================================================="
+echo "START: AD Data import"
+echo "==========================================================================="
+echo "Connecting to $REMOTEHOST ..."
+echo "Running in $PS_MODE mode"
+if [ "$PS_MODE" = "UPDATE" ]
+then
+  ssh -i /home/avcron/.ssh/ad_sync_id_rsa ${REMOTEUSR}@${REMOTEHOST} c:\\Scripts\\bantoad.cmd -UserFilter EMP,STUEMP
+else
+  ssh -i /home/avcron/.ssh/ad_sync_id_rsa ${REMOTEUSR}@${REMOTEHOST} c:\\Scripts\\bantoad.cmd -UserFilter EMP,STUEMP -WhatIf
+fi
+
+#ssh -tt -i /home/avcron/.ssh/ad_sync_id_rsa ${REMOTEUSR}@${REMOTEHOST} << END
+#powershell -File c:\\Scripts\\Win_BanToAD.ps1 -UserFilter EMP,STUEMP -WhatIf
+#END
+
+echo ""
+echo "==========================================================================="
+echo "END: AD Data import"
+echo "==========================================================================="
+
+# ******************************************************************************
+# Do some housekeeping
+# ******************************************************************************
+#echo ""
+#printf "%s" "Cleaning house..."
+# Move the data files and log to the sent folder
+#FILES=./AD*
+#for F in $FILES
+#do
+#  mv ${WORKINGDIR}/`basename $F` ${WORKINGDIR}/_sent/`date +%Y%m%d%H%M%S`_`basename $F`
+#done
+
+# Remove any files that are older than 7 days
+#find ${WORKINGDIR}/_sent/* -mtime +7 -exec rm {} \;
+
+printf "%s\n" "done"
+
+echo "ADSync.shl done"
