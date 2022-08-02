@@ -24,9 +24,12 @@ create or replace package         ad_provisioning as
 --                            pushing it further out delaying the creation of the AD account.
 --                            The fix was to add the buffer to sysdate so that we were 
 --                            looking X days into the future.
---  16 JUN 2022   DC   1.2    The + v_EndBufferDays logic deprovisioned many users. Added a between date condition to fix this. Old row count matches new row count
+--  16 JUN 2022   DC   1.2    The + v_EndBufferDays logic deprovisioned many users. 
+--  Added a between date condition to fix this. Old row count matches new row count
+-- 02 AUG 2022    BA   1.3  Removed the between for the main cursor because some
+--                          employees were being filtered out.
 --**********************************************************************************
-  v_EndBufferDays       number(2) := 14;
+  v_EndBufferDays       number(2) := 30;
 
   cursor c_main is
     select distinct pidm
@@ -34,19 +37,11 @@ create or replace package         ad_provisioning as
               from nbrjobs o
              where o.nbrjobs_status = 'A'
                and o.nbrjobs_ecls_code <> 'RT' -- retired
-               and o.nbrjobs_effective_date between (select max(i.nbrjobs_effective_date)
-                                                 from nbrjobs i
-                                                where i.nbrjobs_pidm = o.nbrjobs_pidm
-                                                  and (i.nbrjobs_effective_date) <= sysdate )
-                                                  
-                                                  and
-                                                  
-                                                  (select max(i.nbrjobs_effective_date)
-                                                 from nbrjobs i
-                                                where i.nbrjobs_pidm = o.nbrjobs_pidm
-                                                  and (i.nbrjobs_effective_date) <= sysdate + v_EndBufferDays)
-                                                  
-                                                  
+               and o.nbrjobs_effective_date = (select 
+                                                 max(i.nbrjobs_effective_date)
+                                               from nbrjobs i
+                                               where i.nbrjobs_pidm = o.nbrjobs_pidm
+                                               and (i.nbrjobs_effective_date) <= sysdate  + v_EndBufferDays)     
             union
             select distinct spriden_pidm    -- contractors
               from spriden
